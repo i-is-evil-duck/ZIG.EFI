@@ -20,7 +20,11 @@ const file_info_guid align(8) = uefi.Guid{
 const CTRL_S = 0x13;
 const CTRL_X = 0x18;
 
+var current_dir: [256]u8 = undefined;
+var current_dir_len: usize = 1;
+
 pub fn main() uefi.Status {
+    current_dir[0] = '/';
     const st = uefi.system_table;
     const out = st.con_out orelse return .DeviceError;
     const in = st.con_in orelse return .DeviceError;
@@ -50,12 +54,17 @@ fn handleCommand(cmd: []const u8, out: *ConOut, in: *ConIn) void {
     if (std.mem.eql(u8, cmd, "help")) {
         print(out,
             \\Commands:
-            \\  help      - Show this message
-            \\  clear     - Clear screen
-            \\  shutdown  - Power off
-            \\  echo TEXT - Print TEXT
-            \\  snek      - Play snake (WASD, C to exit)
-            \\  nano FILE - Edit file (Ctrl+S save, Ctrl+X exit)
+            \\  help        - Show this message
+            \\  clear       - Clear screen
+            \\  ls          - List files
+            \\  cd DIR      - Change directory
+            \\  pwd         - Show current directory
+            \\  shutdown    - Power off
+            \\  reboot      - Reboot system
+            \\  echo TEXT   - Print TEXT
+            \\  snek        - Play snake (WASD, C to exit)
+            \\  nano FILE   - Edit file (ESC: Menu)
+            \\  testkeeb    - Test keyboard (ESC to exit)
             \\
         );
     } else if (std.mem.eql(u8, cmd, "clear")) {
@@ -64,12 +73,31 @@ fn handleCommand(cmd: []const u8, out: *ConOut, in: *ConIn) void {
     } else if (std.mem.eql(u8, cmd, "shutdown")) {
         const rs = uefi.system_table.runtime_services;
         rs.resetSystem(.ResetShutdown, .Success, 0, null);
+    } else if (std.mem.eql(u8, cmd, "reboot")) {
+        const rs = uefi.system_table.runtime_services;
+        rs.resetSystem(.ResetCold, .Success, 0, null);
+    } else if (std.mem.eql(u8, cmd, "ls")) {
+        listFiles(out, current_dir[0..current_dir_len]) catch {
+            print(out, "Error listing files\n");
+        };
+    } else if (std.mem.startsWith(u8, cmd, "cd ")) {
+        const path = cmd[3..];
+        if (!changeDirectory(path)) {
+            print(out, "Directory not found\n");
+        }
+    } else if (std.mem.eql(u8, cmd, "pwd")) {
+        print(out, current_dir[0..current_dir_len]);
+        print(out, "\n");
     } else if (std.mem.startsWith(u8, cmd, "echo ")) {
         print(out, cmd[5..]);
         print(out, "\n");
     } else if (std.mem.eql(u8, cmd, "snek")) {
         runSnake(out, in) catch {
             print(out, "Game error\n");
+        };
+    } else if (std.mem.eql(u8, cmd, "testkeeb") or std.mem.eql(u8, cmd, "test keyboard")) {
+        testKeyboard(out) catch {
+            print(out, "Test error\n");
         };
     } else if (std.mem.startsWith(u8, cmd, "nano ")) {
         const filename = cmd[5..];
@@ -396,6 +424,100 @@ fn saveFile(state: *EditorState, filename: []const u8) !void {
     try writeFileToDisk(filename, buffer[0..pos]);
 }
 
+fn listFiles(out: *ConOut, dir_path: ?[]const u8) !void {
+    const bs = uefi.system_table.boot_services.?;
+
+    var loaded_image: *uefi.protocol.LoadedImage = undefined;
+    var status = bs.openProtocol(uefi.handle, &uefi.protocol.LoadedImage.guid, @ptrCast(&loaded_image), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return error.NoLoadedImage;
+
+    var fs: *SimpleFileSystem = undefined;
+    status = bs.openProtocol(loaded_image.device_handle.?, &SimpleFileSystem.guid, @ptrCast(&fs), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return error.NoFileSystem;
+
+    var root: *FileProtocol = undefined;
+    status = fs.openVolume(&root);
+    if (status != .Success) return error.OpenVolumeFailed;
+    defer _ = root.close();
+
+    var dir = root;
+    if (dir_path) |path| {
+        if (path.len > 1) { // Skip if just "/"
+            var path_buf: [256]u16 = undefined;
+            const file_path = try utf8ToUefiPath(path, &path_buf);
+            status = root.open(&dir, file_path, 1, 0);
+            if (status != .Success) return error.OpenFailed;
+        }
+    }
+
+    var buf: [2048]u8 = undefined;
+    var size: usize = buf.len;
+
+    while (true) {
+        size = buf.len;
+        status = dir.read(&size, &buf);
+        if (status != .Success or size == 0) break;
+
+        var pos: usize = 0;
+        while (pos < size) {
+            const info = @as(*FileInfo, @ptrCast(@alignCast(&buf[pos])));
+            const name = info.getFileName();
+
+            if (info.size == 0) break;
+
+            var name_buf: [256]u8 = undefined;
+            var name_len: usize = 0;
+            var i: usize = 0;
+            while (name[i] != 0 and name_len < name_buf.len - 1) : (i += 1) {
+                name_buf[name_len] = @intCast(name[i]);
+                name_len += 1;
+            }
+            name_buf[name_len] = 0;
+
+            if (info.attribute & FileInfo.efi_file_directory != 0) {
+                print(out, name_buf[0..name_len]);
+                print(out, "/\n");
+            } else {
+                print(out, name_buf[0..name_len]);
+                print(out, "\n");
+            }
+
+            pos += @intCast(info.size);
+        }
+    }
+}
+
+fn changeDirectory(path: []const u8) bool {
+    const bs = uefi.system_table.boot_services.?;
+
+    var loaded_image: *uefi.protocol.LoadedImage = undefined;
+    var status = bs.openProtocol(uefi.handle, &uefi.protocol.LoadedImage.guid, @ptrCast(&loaded_image), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return false;
+
+    var fs: *SimpleFileSystem = undefined;
+    status = bs.openProtocol(loaded_image.device_handle.?, &SimpleFileSystem.guid, @ptrCast(&fs), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return false;
+
+    var root: *FileProtocol = undefined;
+    status = fs.openVolume(&root);
+    if (status != .Success) return false;
+    defer _ = root.close();
+
+    var dir: *FileProtocol = undefined;
+
+    if (path.len > 1) {
+        var path_buf: [256]u16 = undefined;
+        const file_path = utf8ToUefiPath(path, &path_buf) catch return false;
+        status = root.open(&dir, file_path, 1, 0);
+        if (status != .Success) return false;
+        _ = dir.close();
+    }
+
+    current_dir_len = path.len;
+    @memcpy(current_dir[0..path.len], path);
+    return true;
+}
+
 fn readFileFromDisk(filename: []const u8, buffer: []u8) ![]u8 {
     const bs = uefi.system_table.boot_services.?;
 
@@ -478,6 +600,111 @@ fn utf8ToUefiPath(utf8: []const u8, buf: []u16) ![:0]const u16 {
     buf[utf8.len] = 0;
 
     return buf[0..utf8.len :0];
+}
+
+// ============================================
+// KEYBOARD TEST
+// ============================================
+
+fn testKeyboard(out: *ConOut) !void {
+    const input_ex = try getInputEx();
+
+    var last_unicode: u16 = 0;
+    var last_scan_code: u16 = 0;
+
+    while (true) {
+        _ = out.setCursorPosition(0, 0);
+
+        print(out, "=== Keyboard Test ===\n");
+        print(out, "Press any key (ESC to exit)\n\n");
+        print(out, "Last Key:\n");
+        print(out, "  Unicode: ");
+
+        var buf: [16]u8 = undefined;
+        const str = std.fmt.bufPrint(&buf, "{}", .{last_unicode}) catch "-";
+        print(out, str);
+
+        print(out, "\n  ScanCode: 0x");
+        const sc_str = std.fmt.bufPrint(&buf, "{x}", .{last_scan_code}) catch "-";
+        print(out, sc_str);
+        print(out, " (");
+
+        // Show key name based on scan code
+        const key_name: []const u8 = switch (last_scan_code) {
+            0x04 => "A",
+            0x05 => "B",
+            0x06 => "C",
+            0x07 => "D",
+            0x08 => "E",
+            0x09 => "F",
+            0x0A => "G",
+            0x0B => "H",
+            0x0C => "I",
+            0x0D => "J",
+            0x0E => "K",
+            0x0F => "L",
+            0x10 => "M",
+            0x11 => "N",
+            0x12 => "O",
+            0x13 => "P",
+            0x14 => "Q",
+            0x15 => "R",
+            0x16 => "S",
+            0x17 => "DOWN",
+            0x18 => "UP",
+            0x19 => "LEFT",
+            0x1A => "RIGHT",
+            0x1B => "TAB",
+            0x1C => "ENTER",
+            0x1E => "1",
+            0x1F => "2",
+            0x20 => "3",
+            0x21 => "4",
+            0x22 => "5",
+            0x23 => "6",
+            0x24 => "7",
+            0x25 => "8",
+            0x26 => "9",
+            0x27 => "0",
+            0x2D => "-",
+            0x2E => "=",
+            0x2F => "BS",
+            0x32 => "\\",
+            0x33 => ";",
+            0x34 => "'",
+            0x35 => "`",
+            0x39 => "SPACE",
+            0x4A => "HOME",
+            0x4B => "PGUP",
+            0x4C => "DEL",
+            0x4D => "END",
+            0x4E => "PGDN",
+            0x50 => "F1",
+            0x51 => "F2",
+            0x52 => "F3",
+            0x53 => "F4",
+            0x54 => "F5",
+            0x55 => "F6",
+            0x56 => "F7",
+            0x57 => "F8",
+            0x58 => "F9",
+            0x59 => "F10",
+            0x5A => "F11",
+            0x5B => "F12",
+            0x76 => "ESC",
+            else => "?",
+        };
+        print(out, key_name);
+        print(out, ")\n");
+
+        const key = try readKeyRaw(input_ex);
+        last_unicode = key.input.unicode_char;
+        last_scan_code = key.input.scan_code;
+
+        if (key.input.scan_code == 0x76) { // ESC
+            return;
+        }
+    }
 }
 
 // ============================================
