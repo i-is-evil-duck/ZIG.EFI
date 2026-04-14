@@ -23,6 +23,59 @@ const CTRL_X = 0x18;
 var current_dir: [256]u8 = undefined;
 var current_dir_len: usize = 1;
 
+fn resolvePath(path: []const u8) []u8 {
+    var result: [256]u8 = undefined;
+    var result_len: usize = 0;
+
+    if (path.len == 0) {
+        result[0] = '/';
+        result_len = 1;
+    } else if (path[0] == '/') {
+        result[0] = '/';
+        result_len = 1;
+    } else {
+        @memcpy(result[0..current_dir_len], current_dir[0..current_dir_len]);
+        result_len = current_dir_len;
+    }
+
+    var i: usize = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            i += 1;
+            continue;
+        }
+
+        if (path[i] == '.' and i + 1 < path.len and path[i + 1] == '.') {
+            if (result_len > 1) {
+                while (result_len > 1 and result[result_len - 1] != '/') {
+                    result_len -= 1;
+                }
+            }
+            i += 2;
+            if (i < path.len and path[i] == '/') i += 1;
+            continue;
+        }
+
+        if (result_len > 1 and result[result_len - 1] != '/') {
+            result[result_len] = '/';
+            result_len += 1;
+        }
+
+        while (i < path.len and path[i] != '/') {
+            result[result_len] = path[i];
+            result_len += 1;
+            i += 1;
+        }
+    }
+
+    if (result_len == 0) {
+        result[0] = '/';
+        result_len = 1;
+    }
+
+    return result[0..result_len];
+}
+
 pub fn main() uefi.Status {
     current_dir[0] = '/';
     const st = uefi.system_table;
@@ -59,8 +112,13 @@ fn handleCommand(cmd: []const u8, out: *ConOut, in: *ConIn) void {
             \\  ls          - List files
             \\  cd DIR      - Change directory
             \\  pwd         - Show current directory
+            \\  cat FILE    - Display file contents
+            \\  rm FILE     - Delete file
+            \\  mkdir DIR   - Create directory
             \\  shutdown    - Power off
             \\  reboot      - Reboot system
+            \\  date        - Show current time
+            \\  mem         - Show memory info
             \\  echo TEXT   - Print TEXT
             \\  snek        - Play snake (WASD, C to exit)
             \\  nano FILE   - Edit file (ESC: Menu)
@@ -88,6 +146,37 @@ fn handleCommand(cmd: []const u8, out: *ConOut, in: *ConIn) void {
     } else if (std.mem.eql(u8, cmd, "pwd")) {
         print(out, current_dir[0..current_dir_len]);
         print(out, "\n");
+    } else if (std.mem.startsWith(u8, cmd, "cat ")) {
+        const filename = cmd[4..];
+        if (filename.len == 0) {
+            print(out, "Usage: cat <filename>\n");
+            return;
+        }
+        catFile(out, filename) catch {
+            print(out, "Error reading file\n");
+        };
+    } else if (std.mem.startsWith(u8, cmd, "rm ")) {
+        const filename = cmd[3..];
+        if (filename.len == 0) {
+            print(out, "Usage: rm <filename>\n");
+            return;
+        }
+        if (!deleteFile(filename)) {
+            print(out, "Error deleting file\n");
+        }
+    } else if (std.mem.startsWith(u8, cmd, "mkdir ")) {
+        const dirname = cmd[6..];
+        if (dirname.len == 0) {
+            print(out, "Usage: mkdir <dirname>\n");
+            return;
+        }
+        if (!createDirectory(dirname)) {
+            print(out, "Error creating directory\n");
+        }
+    } else if (std.mem.eql(u8, cmd, "date")) {
+        showDate(out);
+    } else if (std.mem.eql(u8, cmd, "mem")) {
+        showMemory(out);
     } else if (std.mem.startsWith(u8, cmd, "echo ")) {
         print(out, cmd[5..]);
         print(out, "\n");
@@ -488,6 +577,8 @@ fn listFiles(out: *ConOut, dir_path: ?[]const u8) !void {
 }
 
 fn changeDirectory(path: []const u8) bool {
+    const resolved = resolvePath(path);
+
     const bs = uefi.system_table.boot_services.?;
 
     var loaded_image: *uefi.protocol.LoadedImage = undefined;
@@ -505,20 +596,22 @@ fn changeDirectory(path: []const u8) bool {
 
     var dir: *FileProtocol = undefined;
 
-    if (path.len > 1) {
+    if (resolved.len > 1) {
         var path_buf: [256]u16 = undefined;
-        const file_path = utf8ToUefiPath(path, &path_buf) catch return false;
+        const file_path = utf8ToUefiPath(resolved, &path_buf) catch return false;
         status = root.open(&dir, file_path, 1, 0);
         if (status != .Success) return false;
         _ = dir.close();
     }
 
-    current_dir_len = path.len;
-    @memcpy(current_dir[0..path.len], path);
+    current_dir_len = resolved.len;
+    @memcpy(current_dir[0..resolved.len], resolved);
     return true;
 }
 
 fn readFileFromDisk(filename: []const u8, buffer: []u8) ![]u8 {
+    const resolved = resolvePath(filename);
+
     const bs = uefi.system_table.boot_services.?;
 
     var loaded_image: *uefi.protocol.LoadedImage = undefined;
@@ -535,7 +628,7 @@ fn readFileFromDisk(filename: []const u8, buffer: []u8) ![]u8 {
     defer _ = root.close();
 
     var path_buf: [256]u16 = undefined;
-    const file_path = try utf8ToUefiPath(filename, &path_buf);
+    const file_path = try utf8ToUefiPath(resolved, &path_buf);
 
     var file: *FileProtocol = undefined;
     status = root.open(&file, file_path, 1, 0);
@@ -560,6 +653,8 @@ fn readFileFromDisk(filename: []const u8, buffer: []u8) ![]u8 {
 }
 
 fn writeFileToDisk(filename: []const u8, data: []const u8) !void {
+    const resolved = resolvePath(filename);
+
     const bs = uefi.system_table.boot_services.?;
 
     var loaded_image: *uefi.protocol.LoadedImage = undefined;
@@ -576,7 +671,7 @@ fn writeFileToDisk(filename: []const u8, data: []const u8) !void {
     defer _ = root.close();
 
     var path_buf: [256]u16 = undefined;
-    const file_path = try utf8ToUefiPath(filename, &path_buf);
+    const file_path = try utf8ToUefiPath(resolved, &path_buf);
 
     var file: *FileProtocol = undefined;
     status = root.open(&file, file_path, FileProtocol.efi_file_mode_read | FileProtocol.efi_file_mode_write | FileProtocol.efi_file_mode_create, 0);
@@ -589,6 +684,121 @@ fn writeFileToDisk(filename: []const u8, data: []const u8) !void {
 
     status = file.flush();
     if (status != .Success) return error.FlushFailed;
+}
+
+fn catFile(out: *ConOut, filename: []const u8) !void {
+    var buffer: [8192]u8 = undefined;
+    const data = readFileFromDisk(filename, &buffer) catch {
+        print(out, "File not found\n");
+        return;
+    };
+    print(out, data);
+}
+
+fn deleteFile(filename: []const u8) bool {
+    const resolved = resolvePath(filename);
+
+    const bs = uefi.system_table.boot_services.?;
+
+    var loaded_image: *uefi.protocol.LoadedImage = undefined;
+    var status = bs.openProtocol(uefi.handle, &uefi.protocol.LoadedImage.guid, @ptrCast(&loaded_image), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return false;
+
+    var fs: *SimpleFileSystem = undefined;
+    status = bs.openProtocol(loaded_image.device_handle.?, &SimpleFileSystem.guid, @ptrCast(&fs), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return false;
+
+    var root: *FileProtocol = undefined;
+    status = fs.openVolume(&root);
+    if (status != .Success) return false;
+    defer _ = root.close();
+
+    var path_buf: [256]u16 = undefined;
+    const file_path = utf8ToUefiPath(resolved, &path_buf) catch return false;
+
+    var file: *FileProtocol = undefined;
+    status = root.open(&file, file_path, 1, 0);
+    if (status != .Success) return false;
+
+    status = file.delete();
+    return status == .Success;
+}
+
+fn createDirectory(dirname: []const u8) bool {
+    const resolved = resolvePath(dirname);
+
+    const bs = uefi.system_table.boot_services.?;
+
+    var loaded_image: *uefi.protocol.LoadedImage = undefined;
+    var status = bs.openProtocol(uefi.handle, &uefi.protocol.LoadedImage.guid, @ptrCast(&loaded_image), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return false;
+
+    var fs: *SimpleFileSystem = undefined;
+    status = bs.openProtocol(loaded_image.device_handle.?, &SimpleFileSystem.guid, @ptrCast(&fs), uefi.handle, null, .{ .by_handle_protocol = true });
+    if (status != .Success) return false;
+
+    var root: *FileProtocol = undefined;
+    status = fs.openVolume(&root);
+    if (status != .Success) return false;
+    defer _ = root.close();
+
+    var path_buf: [256]u16 = undefined;
+    const file_path = utf8ToUefiPath(resolved, &path_buf) catch return false;
+
+    var dir: *FileProtocol = undefined;
+    status = root.open(&dir, file_path, FileProtocol.efi_file_mode_read | FileProtocol.efi_file_mode_create, FileProtocol.efi_file_directory);
+    if (status != .Success) return false;
+    _ = dir.close();
+
+    return true;
+}
+
+fn showDate(out: *ConOut) void {
+    const st = uefi.system_table;
+    const rt = st.runtime_services;
+
+    var time: uefi.Time = undefined;
+    var caps: uefi.TimeCapabilities = undefined;
+    const status = rt.getTime(&time, &caps);
+    if (status != .Success) {
+        print(out, "Unable to get time\n");
+        return;
+    }
+
+    var buf: [32]u8 = undefined;
+    const str = std.fmt.bufPrint(&buf, "{d}/{d}/{d} {d}:{d}:{d}", .{ time.month, time.day, time.year, time.hour, time.minute, time.second }) catch "";
+    print(out, str);
+    print(out, "\n");
+}
+
+fn showMemory(out: *ConOut) void {
+    const bs = uefi.system_table.boot_services.?;
+
+    var map_size: usize = 0;
+    var map_key: usize = 0;
+    var desc_size: usize = 0;
+    var desc_ver: u32 = undefined;
+
+    _ = bs.getMemoryMap(&map_size, null, &map_key, &desc_size, &desc_ver);
+
+    var buf: [16384]u8 = undefined;
+    map_size = buf.len;
+    const mmap = @as([*]uefi.tables.MemoryDescriptor, @ptrCast(@alignCast(&buf)));
+    _ = bs.getMemoryMap(&map_size, mmap, &map_key, &desc_size, &desc_ver);
+
+    var total_pages: usize = 0;
+    var pos: usize = 0;
+    while (pos < map_size) {
+        const desc = @as(*uefi.tables.MemoryDescriptor, @ptrCast(@alignCast(&buf[pos])));
+        if (desc.type == .ConventionalMemory) {
+            total_pages += desc.number_of_pages;
+        }
+        pos += desc_size;
+    }
+
+    var buf2: [32]u8 = undefined;
+    const str = std.fmt.bufPrint(&buf2, "Total Memory: {} KB\n", .{total_pages * 4}) catch "";
+    print(out, str);
 }
 
 fn utf8ToUefiPath(utf8: []const u8, buf: []u16) ![:0]const u16 {
