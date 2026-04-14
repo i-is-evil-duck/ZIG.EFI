@@ -120,7 +120,8 @@ fn runNano(out: *ConOut, _: *ConIn, filename: []const u8) !void {
     try loadFile(&state, filename);
 
     const input_ex = try getInputEx();
-    if (out.clearScreen() != .Success) return;
+    _ = out.clearScreen();
+    drawEditor(out, &state);
 
     while (true) {
         drawEditor(out, &state);
@@ -160,33 +161,47 @@ fn runNano(out: *ConOut, _: *ConIn, filename: []const u8) !void {
             else => {},
         }
 
-        // Handle control keys and regular input
-        const ctrl_pressed = key.state.shift.left_control_pressed or key.state.shift.right_control_pressed;
-        if (ctrl_pressed and key.input.unicode_char == CTRL_X) {
-            _ = out.clearScreen();
-            print(out, "Exited without saving\n");
-            return;
-        } else if (ctrl_pressed and key.input.unicode_char == CTRL_S) {
-            if (saveFile(&state, filename)) {
-                showMessage(out, "Saved!");
-            } else |_| {
-                showMessage(out, "Save failed!");
-            }
-        } else if (key.input.unicode_char == '\r' or key.input.unicode_char == '\n') {
+        // Handle regular input (no Ctrl detection, use ESC for menu)
+        if (key.input.unicode_char == '\r' or key.input.unicode_char == '\n') {
             try insertNewline(&state);
         } else if (key.input.unicode_char == '\x08' or key.input.unicode_char == 0x7F) {
             try backspace(&state);
         } else if (key.input.unicode_char >= 32 and key.input.unicode_char < 127) {
             try insertChar(&state, @intCast(key.input.unicode_char));
+        } else if (key.input.scan_code == 0x17) { // ESC
+            // Show menu
+            _ = out.clearScreen();
+            print(out, "=== Menu ===\n");
+            print(out, "S - Save file\n");
+            print(out, "X - Exit without saving\n");
+            print(out, "ESC - Return to editor\n\n");
+            print(out, "Press key: ");
+
+            const menu_key = try readKeyRaw(input_ex);
+
+            if (menu_key.input.scan_code == 0x17) { // ESC - go back
+                _ = out.clearScreen();
+                drawEditor(out, &state);
+            } else if (menu_key.input.unicode_char == 's' or menu_key.input.unicode_char == 'S') {
+                if (saveFile(&state, filename)) {
+                    showMessage(out, "Saved!", &state);
+                } else |_| {
+                    showMessage(out, "Save failed!", &state);
+                }
+            } else if (menu_key.input.unicode_char == 'x' or menu_key.input.unicode_char == 'X') {
+                _ = out.clearScreen();
+                print(out, "Exited without saving\n");
+                return;
+            }
         }
     }
 }
 
 fn drawEditor(out: *ConOut, state: *EditorState) void {
-    if (out.clearScreen() != .Success) return;
+    _ = out.setCursorPosition(0, 0);
 
     var status_buf: [80]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, "MiniNano - {s} [Ctrl+S: Save, Ctrl+X: Exit]", .{state.filename}) catch "MiniNano";
+    const status = std.fmt.bufPrint(&status_buf, "MiniNano - {s} [ESC: Menu]", .{state.filename}) catch "MiniNano";
     print(out, status);
     print(out, "\n");
     print(out, "------------------------------------------------------------------------------\n");
@@ -292,13 +307,15 @@ fn insertNewline(state: *EditorState) !void {
     state.cursor_x = 0;
 }
 
-fn showMessage(out: *ConOut, msg: []const u8) void {
+fn showMessage(out: *ConOut, msg: []const u8, state: *EditorState) void {
     _ = out.setCursorPosition(0, 23);
     print(out, msg);
     // Wait for any key
     const in = uefi.system_table.con_in orelse return;
     var key: ConIn.Key.Input = undefined;
     _ = in.readKeyStroke(&key);
+    _ = out.clearScreen();
+    drawEditor(out, state);
 }
 
 // ============================================
